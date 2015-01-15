@@ -1,10 +1,10 @@
-#from __future__ import print_function
 import sqlite3 as sql
 from urllib2 import Request, urlopen, URLError
 from bs4 import BeautifulSoup
 import os, re, warnings, codecs, sys, shutil
 
 THREAD_URL = "https://bitcointalk.org/index.php?topic={}.0;all"
+BOARD_URL = "https://bitcointalk.org/index.php?board={}.{}"
 
 #converts HTML entities to unicode.
 def H2U(text):
@@ -12,13 +12,27 @@ def H2U(text):
 		warnings.simplefilter("ignore")
 		return BeautifulSoup(text).get_text()
 
-def fetchHTML(tid):
+#returns html content, either from a cache or from the web
+def fetchThreadHTML(tid):
 	tid = str(tid)
 	path = os.path.join('htmldata', tid+'.html')
 	if os.path.exists(path):
-		f = open(path, 'r')
-		return (True, f.read())
+		with open(path, 'r') as f:
+			contents = f.read()
+		os.remove(path)
+		return (True, contents)
 	url = THREAD_URL.format(tid)
+	req = Request(url)
+	try:
+		response = urlopen(req)
+	except URLError as e:
+		print("unable to open " + url)
+		req = Request(url)
+		return (False, "")
+	else:
+		return (True, response.read())
+
+def fetchHTML(url):
 	req = Request(url)
 	try:
 		response = urlopen(req)
@@ -31,6 +45,10 @@ def fetchHTML(tid):
 
 def createTables(cur):
 	command = '''CREATE TABLE IF NOT EXISTS Boards (
+	board_id INTEGER PRIMARY KEY,
+	name TEXT)'''
+	cur.execute(command)
+	command = '''CREATE TABLE IF NOT EXISTS ForeignBoards (
 	board_id INTEGER PRIMARY KEY,
 	name TEXT)'''
 	cur.execute(command)
@@ -50,9 +68,18 @@ def createTables(cur):
 	CREATE TABLE IF NOT EXISTS InvalidThreads (thread_id Integer primary key)
 	'''
 	cur.execute(command)
+	command = '''
+	CREATE TABLE IF NOT EXISTS ForeignThreads (thread_id Integer primary key)
+	'''
+	cur.execute(command)
+	command = '''
+	CREATE TABLE IF NOT EXISTS ThreadIds (thread_id Integer primary key)
+	'''
+	cur.execute(command)
 
 def addBoards(cur):
 	f = open('boards.txt', 'r')
+	foreign = False
 	for rline in f.readlines():
 		line = rline.strip()
 		regex = r'board=(.*)"'
@@ -61,15 +88,22 @@ def addBoards(cur):
 		regex = r'=> (.*)<'
 		m = re.search(regex, line)
 		bname = H2U(m.group(1))
-		command = '''INSERT OR IGNORE INTO Boards (board_id, name)
-		VALUES (?,?)
-		'''
+		if not foreign:
+			command = '''INSERT OR IGNORE INTO Boards (board_id, name)
+			VALUES (?,?)
+			'''
+		else:
+			command = '''INSERT OR IGNORE INTO ForeignBoards (board_id, name)
+			VALUES (?,?)'''
 		cur.execute(command, (bid, bname))
+		if bid == 198:
+			foreign = True
 
 def isValidThread(content):
 	return ('The topic or board you are looking for appears to be either missing or off limits to you.' not in content)
 
-def parseThread(content):
+#parses html for data. If parent board id is in ignoreBoards, return False
+def parseThread(content, ignoreBoards):
 	parent_bid = -1
 	title = u''
 	date = u''
@@ -82,10 +116,8 @@ def parseThread(content):
 			m = re.search(regex, line)
 			if m is not None:
 				parent_bid = int(float(m.group(1)))
-				"""
-				if parent_bid not in [1,7,57,34,14]:
+				if parent_bid in ignoreBoards:
 					return False
-				"""
 		#find the thread title
 		if title == "":
 			regex = r'<title>(.*)</title>'
@@ -104,17 +136,19 @@ def parseThread(content):
 	postsString = '\n'.join(posts)
 	return (title, postsString, parent_bid, date)
 
-def downloadThread(thread_id, cur):
-	htmlresult = fetchHTML(thread_id)
+def downloadThread(thread_id, ignoreBoards, cur):
+	htmlresult = fetchThreadHTML(thread_id)
 	if not htmlresult[0]:
 		return False
 	content = htmlresult[1]
 	if not isValidThread(content):
-		command = '''INSERT INTO InvalidThreads (thread_id) VALUES (?)'''
+		command = '''INSERT OR IGNORE INTO InvalidThreads (thread_id) VALUES (?)'''
 		cur.execute(command, (thread_id,))
 		return False
-	vals = parseThread(content)
+	vals = parseThread(content, ignoreBoards)
 	if vals == False:
+		command = '''INSERT OR IGNORE INTO ForeignThreads (thread_id) VALUES (?)'''
+		cur.execute(command, (thread_id,))
 		return False
 	topic, posts, parent_bid, op_date = vals
 	path = os.path.join("data","temp.temp")
@@ -122,17 +156,94 @@ def downloadThread(thread_id, cur):
 		f.write(content)
 	with open(path, 'rb') as f:
 		ablob = f.read()
-	command = '''INSERT INTO Threads 
+	command = '''INSERT OR IGNORE INTO Threads 
 	(thread_id, topic, posts, parent_bid, op_date, html_content)
 	VALUES(?,?,?,?,?,?)'''
 	cur.execute(command, \
 			(thread_id, topic, posts, parent_bid, op_date, sql.Binary(ablob)))
 	return True
 
+def removeForeignThreads(cur):
+	command = '''SELECT board_id FROM ForeignBoards'''
+	cur.execute(command)
+	fbs = cur.fetchall()
+	command = '''SELECT thread_id FROM Threads WHERE parent_bid=?'''
+	command2 = '''INSERT INTO ForeignThreads (thread_id) VALUES (?)'''
+	command3 = '''DELETE FROM Threads WHERE parent_bid=?'''
+	command4 = '''DELETE FROM Boards WHERE board_id=?'''
+	for fb in fbs:
+		cur.execute(command, fb)
+		ts = cur.fetchall()
+		cur.executemany(command2, ts)
+	cur.executemany(command3, fbs)
+	cur.executemany(command4, fbs)
+
 def countThreads(cur):
 	command = '''SELECT COUNT(*) FROM Threads'''
 	cur.execute(command)
 	return cur.fetchone()[0]
+
+def getIgnoreThreads(cur):
+	command = '''SELECT thread_id FROM Threads
+	UNION SELECT thread_id FROM InvalidThreads
+	UNION SELECT thread_id FROM ForeignThreads'''
+	cur.execute(command)
+	return set([i[0] for i in cur.fetchall()])
+
+def getIgnoreBoards(cur):
+	command = '''SELECT board_id from ForeignBoards'''
+	cur.execute(command)
+	return set([i[0] for i in cur.fetchall()])
+
+def getPageTopics(boardId, page):
+	topics = set()
+	url = BOARD_URL.format(boardId, str(page*40))
+	html = fetchHTML(url)[1]
+	regex = r'\?topic=([1-9]*)\.'
+	for line in html.split('\n'):
+		m = re.search(regex, line)
+		if m is not None:
+			topics.add(int(m.group(1)))
+	return topics
+
+def getBoardPages(html):
+	for line in html.split('\n'):
+		if 'id="toppages"' in line:
+			break
+	regex = r'>([1-9]*)<'
+	return range(int(re.findall(regex, line)[-1]))[1:]
+
+#returns a list of ids of all the topics in a board
+def getAllTopics(boardId, con):
+	topics = []
+	numThreads = countThreads(con.cursor())
+	html = fetchHTML(BOARD_URL.format(boardId, '0'))
+	if not html[0]:
+		return topics
+	else:
+		html = html[1]
+	pages = getBoardPages(html)
+	ignoreThreads = getIgnoreThreads(con.cursor())
+	command = "INSERT OR IGNORE INTO ThreadIds (thread_id) VALUES (?)"
+	for page in pages[150:]:
+		print(page)
+		topics = getPageTopics(boardId, page)
+		for topic in topics:
+			with con:
+				con.cursor().execute(command, (topic,))
+
+def downloadAllTopics(con):
+	command = '''SELECT thread_id FROM ThreadIds
+	WHERE thread_id NOT IN (
+	SELECT thread_id FROM Threads)'''
+	cur = con.cursor()
+	cur.execute(command)
+	todl = [i[0] for i in cur.fetchall()][::-1]
+	for t in todl:
+		with con:
+			sys.stdout.write("\rdownloading thread {}".format(t))
+			sys.stdout.flush()
+			downloadThread(t, [], cur)
 
 def main():
 	if len(sys.argv) != 2:
@@ -145,24 +256,11 @@ def main():
 		cur = con.cursor()
 		createTables(cur)
 		addBoards(cur)
-		command = '''SELECT thread_id FROM Threads'''
-		cur.execute(command)
-		ignore = set([i[0] for i in cur.fetchall()])
-		command = '''SELECT thread_id FROM InvalidThreads'''
-		cur.execute(command)
-		ignore.update([i[0] for i in cur.fetchall()])
-	numThreads = countThreads(con.cursor())
-	for i in range(903800)[::-1]:
-		if i not in ignore:
-			with con:
-				cur = con.cursor()
-				if downloadThread(i, cur):
-					numThreads += 1
-					sys.stdout.write("\rStored thread \t\t{}\tTotal threads: {}            ".format(i, numThreads))
-					sys.stdout.flush()
-				else:
-					sys.stdout.write("\rDidn't store thread \t{}\tTotal threads: {}            ".format(i, numThreads))
-					sys.stdout.flush()
+		ignoreThreads = getIgnoreThreads(cur)
+		ignoreBoards = getIgnoreBoards(cur)
+	with con:
+		getAllTopics(1, con)
+		downloadAllTopics(con)
 
 if __name__=='__main__':
 	main()
